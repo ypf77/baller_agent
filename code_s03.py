@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """
-s02: Tool Use — 在 s01 基础上新增 4 个工具 + 分发映射。
+s03_permission.py - Permission System
 
-运行: python code_s02.py
-需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
+Three gates inserted before tool execution:
 
-本文件 = s01 的全部代码 + 以下新增:
-  + run_read / run_write / run_edit / run_glob 四个工具实现
-  + TOOL_HANDLERS 分发映射（替代 s01 中硬编码的 run_bash 调用）
-  + safe_path 路径安全校验
+    Gate 1: Hard deny list (rm -rf /, sudo, ...)
+    Gate 2: Rule matching (write outside workspace? destructive cmd?)
+    Gate 3: User approval (pause and wait for confirmation)
 
-循环本身（agent_loop）与 s01 完全一致。
+    +-------+    +--------+    +--------+    +--------+    +------+
+    | Tool  | -> | Gate 1 | -> | Gate 2 | -> | Gate 3 | -> | Exec |
+    | call  |    | deny?  |    | match? |    | allow? |    |      |
+    +-------+    +--------+    +--------+    +--------+    +------+
+         |            |             |             |
+         v            v             v             v
+      (normal)     (blocked)    (ask user)   (user says no?)
+
+Only one line added to the agent loop:
+
+    if not check_permission(block):
+        continue
+
+Builds on s02 (multi-tool). Usage:
+
+    python s03_permission/code.py
+    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 
 import os
@@ -20,7 +34,6 @@ from pathlib import Path
 
 try:
     import readline
-    # macOS 的 libedit 在处理中文输入时有退格问题，这四行修复它
     readline.parse_and_bind('set bind-tty-special-chars off')
     readline.parse_and_bind('set input-meta on')
     readline.parse_and_bind('set output-meta on')
@@ -57,10 +70,6 @@ def safe_path(path: str) -> Path:
 # ── Tool implementations ────────────────────────────────
 def run_bash(command: str) -> str:
     """安全执行 shell 命令"""
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/", "mkfs", "dd if="]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
-    
     try:
         r = subprocess.run(
             command, shell=True, cwd=str(WORKDIR),
@@ -240,6 +249,86 @@ TOOLS = [
 ]
 
 
+# ═══════════════════════════════════════════════════════════
+#  Three-Gate Permission Pipeline
+# ═══════════════════════════════════════════════════════════
+
+# Gate 1: Hard deny list — 直接拒绝
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+
+def check_deny_list(tool_name: str, args: dict) -> str | None:
+    """检查是否命中硬拒绝列表"""
+    if tool_name == "bash":
+        command = args.get("command", "")
+        for pattern in DENY_LIST:
+            if pattern in command:
+                return f"'{pattern}' is on the deny list"
+    return None
+
+
+# Gate 2: Rule matching — 上下文检查
+PERMISSION_RULES = [
+    {
+        "tools": ["write_file", "edit_file"],
+        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+        "message": "Writing outside workspace"
+    },
+    {
+        "tools": ["bash"],
+        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+        "message": "Potentially destructive command"
+    },
+]
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    """检查是否命中规则"""
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"]:
+            try:
+                if rule["check"](args):
+                    return rule["message"]
+            except Exception:
+                pass  # 规则检查异常时跳过
+    return None
+
+
+# Gate 3: User approval — 人工确认
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    """询问用户是否允许执行"""
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"   Tool: {tool_name}")
+    for k, v in args.items():
+        print(f"   {k}: {str(v)[:100]}")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+# Pipeline: 三级权限检查
+def check_permission(tool_name: str, args: dict) -> bool:
+    """
+    三级权限检查流水线：
+    1. Deny list → 直接拒绝
+    2. Rules → 触发则进入人工审批
+    3. User approval → 用户确认
+    """
+    # Gate 1: Deny list
+    reason = check_deny_list(tool_name, args)
+    if reason:
+        print(f"\n\033[31m⛔ DENIED: {reason}\033[0m")
+        return False
+    
+    # Gate 2: Rules → Gate 3: User approval
+    reason = check_rules(tool_name, args)
+    if reason:
+        decision = ask_user(tool_name, args, reason)
+        if decision == "deny":
+            print(f"\033[31m⛔ User denied\033[0m")
+            return False
+        print(f"\033[32m✅ User approved\033[0m")
+    
+    return True
+
+
 # ── DeepSeek API 调用封装 ──────────────────────
 def call_deepseek(messages: list):
     """调用 DeepSeek API"""
@@ -295,17 +384,22 @@ def agent_loop(messages: list):
         for tool_call in response_message.tool_calls:
             tool_name = tool_call.function.name
             
-            # 解析参数（JSON 字符串 → dict）
+            # 解析参数
             try:
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
                 args = {}
             
-            # 🎯 字典分发 + **args 解包，无需 if-elif
-            print(f"\033[33m> {tool_name}\033[0m")
-            handler = TOOL_HANDLERS.get(tool_name)
-            output = handler(**args) if handler else f"Error: Unknown tool {tool_name}"
-            print(str(output)[:200])
+            # 🛡️ 权限检查（三级流水线）
+            if not check_permission(tool_name, args):
+                output = "Permission denied by security pipeline"
+                print(f"\033[31m⛔ {output}\033[0m")
+            else:
+                # 🎯 字典分发 + **args 解包
+                print(f"\033[33m> {tool_name}\033[0m")
+                handler = TOOL_HANDLERS.get(tool_name)
+                output = handler(**args) if handler else f"Error: Unknown tool {tool_name}"
+                print(str(output)[:200])
             
             # 将工具执行结果添加到消息历史
             messages.append({
@@ -319,11 +413,12 @@ def agent_loop(messages: list):
 # ── 主入口 ──────────────────────────────────────
 if __name__ == "__main__":
     print("\033[36m" + "="*60 + "\033[0m")
-    print("\033[36m🚀 DeepSeek Agent Loop\033[0m")
+    print("\033[36m🚀 DeepSeek Agent Loop (with Permission Pipeline)\033[0m")
     print("\033[36m" + "="*60 + "\033[0m")
     print(f"📁 工作目录: {WORKDIR}")
     print(f"🤖 使用模型: {MODEL}")
     print(f"🛠️  可用工具: {', '.join(TOOL_HANDLERS.keys())}")
+    print(f"🛡️  安全: 三级权限校验已启用")
     print("\n使用方法：")
     print("  - 输入任务描述，回车发送")
     print("  - 输入 'q' 或 'exit' 退出")
