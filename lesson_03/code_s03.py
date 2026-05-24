@@ -23,7 +23,7 @@ Only one line added to the agent loop:
 
 Builds on s02 (multi-tool). Usage:
 
-    python s03_permission/code.py
+    python code_s03.py
     Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 

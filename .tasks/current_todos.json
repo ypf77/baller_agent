@@ -1,0 +1,10 @@
+[
+  {
+    "content": "Create a basic hello.py file",
+    "status": "completed"
+  },
+  {
+    "content": "Refactor hello.py: add type hints, docstrings, and a main guard",
+    "status": "completed"
+  }
+]
